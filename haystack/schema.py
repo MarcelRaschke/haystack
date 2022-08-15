@@ -1,4 +1,6 @@
 from __future__ import annotations
+import csv
+import hashlib
 
 import typing
 from typing import Any, Optional, Dict, List, Union
@@ -507,15 +509,20 @@ class Label:
 
         self.updated_at = updated_at
         self.query = query
+
+        # TODO: fix MultiLabel serialization without hacking Label
+        # As this is called during pydantic validation when MultiLabel is being serialized,
+        # answer might still be a dict breaking the following no_answer validation code.
+        if isinstance(answer, dict):
+            answer = Answer.from_dict(answer)
         self.answer = answer
+        if isinstance(document, dict):
+            document = Document.from_dict(document)
         self.document = document
+
         self.is_correct_answer = is_correct_answer
         self.is_correct_document = is_correct_document
         self.origin = origin
-
-        # Remove
-        # self.document_id = document_id
-        # self.offset_start_in_doc = offset_start_in_doc
 
         # If an Answer is provided we need to make sure that it's consistent with the `no_answer` value
         # TODO: reassess if we want to enforce Span.start=0 and Span.end=0 for no_answer=True
@@ -586,7 +593,7 @@ class Label:
         )
 
     def __repr__(self):
-        return str(self.to_dict())
+        return f"<Label: {self.to_dict()}>"
 
     def __str__(self):
         return f"<Label: {self.to_dict()}>"
@@ -609,7 +616,7 @@ class MultiLabel:
     offsets_in_contexts: List[Dict]
     offsets_in_documents: List[Dict]
 
-    def __init__(self, labels: List[Label], drop_negative_labels=False, drop_no_answers=False):
+    def __init__(self, labels: List[Label], drop_negative_labels=False, drop_no_answers=False, **kwargs):
         """
         There are often multiple `Labels` associated with a single query. For example, there can be multiple annotated
         answers for one question or multiple documents contain the information you want for a query.
@@ -621,9 +628,10 @@ class MultiLabel:
         :param labels: A list of labels that belong to a similar query and shall be "grouped" together
         :param drop_negative_labels: Whether to drop negative labels from that group (e.g. thumbs down feedback from UI)
         :param drop_no_answers: Whether to drop labels that specify the answer is impossible
+        :param kwargs: All additional attributes are ignored. This is just a workaround to enable smooth `to_dict()`-`from_dict()`-(de)serialization.
         """
         # drop duplicate labels and remove negative labels if needed.
-        labels = list(set(labels))
+        labels = list(dict.fromkeys(labels))
         if drop_negative_labels:
             labels = [l for l in labels if is_positive_label(l)]
 
@@ -634,7 +642,7 @@ class MultiLabel:
 
         self.query = self._aggregate_labels(key="query", must_be_single_value=True)[0]
         self.filters = self._aggregate_labels(key="filters", must_be_single_value=True)[0]
-        self.id = hash((self.query, json.dumps(self.filters, sort_keys=True).encode()))
+        self.id = hashlib.md5((self.query + json.dumps(self.filters, sort_keys=True)).encode()).hexdigest()
 
         # Currently no_answer is only true if all labels are "no_answers", we could later introduce a param here to let
         # users decided which aggregation logic they want
@@ -703,7 +711,7 @@ class MultiLabel:
         return cls.from_dict(data)
 
     def __repr__(self):
-        return str(self.to_dict())
+        return f"<MultiLabel: {self.to_dict()}>"
 
     def __str__(self):
         return f"<MultiLabel: {self.to_dict()}>"
@@ -712,7 +720,7 @@ class MultiLabel:
 def _pydantic_dataclass_from_dict(dict: dict, pydantic_dataclass_type) -> Any:
     """
     Constructs a pydantic dataclass from a dict incl. other nested dataclasses.
-    This allows simple de-serialization of pydentic dataclasses from json.
+    This allows simple de-serialization of pydantic dataclasses from json.
     :param dict: Dict containing all attributes and values for the dataclass.
     :param pydantic_dataclass_type: The class of the dataclass that should be constructed (e.g. Document)
     """
@@ -932,6 +940,8 @@ class EvaluationResult:
         ] = "document_id_or_answer",
         document_metric: str = "recall_single_hit",
         answer_metric: str = "f1",
+        document_metric_threshold: float = 0.5,
+        answer_metric_threshold: float = 0.5,
         eval_mode: Literal["integrated", "isolated"] = "integrated",
         answer_scope: Literal["any", "context", "document_id", "document_id_and_context"] = "any",
     ) -> List[Dict]:
@@ -948,8 +958,12 @@ class EvaluationResult:
             remarks: there might be a discrepancy between simulated reader metrics and an actual pipeline run with retriever top_k
         :param document_metric: the document metric worst queries are calculated with.
             values can be: 'recall_single_hit', 'recall_multi_hit', 'mrr', 'map', 'precision'
-        :param document_metric: the answer metric worst queries are calculated with.
+        :param answer_metric: the answer metric worst queries are calculated with.
             values can be: 'f1', 'exact_match' and 'sas' if the evaluation was made using a SAS model.
+        :param document_metric_threshold: the threshold for the document metric (only samples below selected metric
+        threshold will be considered)
+        :param answer_metric_threshold: the threshold for the answer metric (only samples below selected metric
+        threshold will be considered)
         :param eval_mode: the input on which the node was evaluated on.
             Usually nodes get evaluated on the prediction provided by its predecessor nodes in the pipeline (value='integrated').
             However, as the quality of the node itself can heavily depend on the node's input and thus the predecessor's quality,
@@ -1000,19 +1014,26 @@ class EvaluationResult:
             wrong_examples = []
             for multilabel_id, metrics in worst_df.iterrows():
                 query_answers = answers[answers["multilabel_id"] == multilabel_id]
-                query_dict = {
-                    "multilabel_id": query_answers["multilabel_id"].iloc[0],
-                    "query": query_answers["query"].iloc[0],
-                    "filters": query_answers["filters"].iloc[0],
-                    "metrics": metrics.to_dict(),
-                    "answers": query_answers.drop(
-                        ["node", "query", "type", "gold_answers", "gold_offsets_in_documents", "gold_document_ids"],
-                        axis=1,
-                    ).to_dict(orient="records"),
-                    "gold_answers": query_answers["gold_answers"].iloc[0],
-                    "gold_document_ids": query_answers["gold_document_ids"].iloc[0],
-                }
-                wrong_examples.append(query_dict)
+                if answer_metric not in metrics:
+                    logger.warning(
+                        f"You specified an answer_metric={answer_metric} not available in calculated metrics={metrics.keys()}."
+                        f"Skipping collection of worst performing samples."
+                    )
+                    break
+                if metrics[answer_metric] <= answer_metric_threshold:
+                    query_dict = {
+                        "multilabel_id": query_answers["multilabel_id"].iloc[0],
+                        "query": query_answers["query"].iloc[0],
+                        "filters": query_answers["filters"].iloc[0],
+                        "metrics": metrics.to_dict(),
+                        "answers": query_answers.drop(
+                            ["node", "query", "type", "gold_answers", "gold_offsets_in_documents", "gold_document_ids"],
+                            axis=1,
+                        ).to_dict(orient="records"),
+                        "gold_answers": query_answers["gold_answers"].iloc[0],
+                        "gold_document_ids": query_answers["gold_document_ids"].iloc[0],
+                    }
+                    wrong_examples.append(query_dict)
             return wrong_examples
 
         documents = node_df[node_df["type"] == "document"]
@@ -1028,19 +1049,26 @@ class EvaluationResult:
             worst_df = metrics_df.sort_values(by=[document_metric]).head(n)
             wrong_examples = []
             for multilabel_id, metrics in worst_df.iterrows():
-                query_documents = documents[documents["multilabel_id"] == multilabel_id]
-                query_dict = {
-                    "multilabel_id": query_documents["multilabel_id"].iloc[0],
-                    "query": query_documents["query"].iloc[0],
-                    "filters": query_documents["filters"].iloc[0],
-                    "metrics": metrics.to_dict(),
-                    "documents": query_documents.drop(
-                        ["node", "query", "multilabel_id", "filters", "type", "gold_document_ids", "gold_contexts"],
-                        axis=1,
-                    ).to_dict(orient="records"),
-                    "gold_document_ids": query_documents["gold_document_ids"].iloc[0],
-                }
-                wrong_examples.append(query_dict)
+                if document_metric not in metrics:
+                    logger.warning(
+                        f"You specified a document_metric={document_metric} not available in calculated metrics={metrics.keys()}."
+                        f"Skipping collection of worst performing samples."
+                    )
+                    break
+                if metrics[document_metric] <= document_metric_threshold:
+                    query_documents = documents[documents["multilabel_id"] == multilabel_id]
+                    query_dict = {
+                        "multilabel_id": query_documents["multilabel_id"].iloc[0],
+                        "query": query_documents["query"].iloc[0],
+                        "filters": query_documents["filters"].iloc[0],
+                        "metrics": metrics.to_dict(),
+                        "documents": query_documents.drop(
+                            ["node", "query", "multilabel_id", "filters", "type", "gold_document_ids", "gold_contexts"],
+                            axis=1,
+                        ).to_dict(orient="records"),
+                        "gold_document_ids": query_documents["gold_document_ids"].iloc[0],
+                    }
+                    wrong_examples.append(query_dict)
             return wrong_examples
 
         return []
@@ -1148,8 +1176,10 @@ class EvaluationResult:
             simulated_top_k_retriever=simulated_top_k_retriever,
             answer_scope=answer_scope,
         )
-
-        return {metric: metrics_df[metric].mean() for metric in metrics_df.columns}
+        num_examples_for_eval = len(answers["multilabel_id"].unique())
+        result = {metric: metrics_df[metric].mean() for metric in metrics_df.columns}
+        result["num_examples_for_eval"] = float(num_examples_for_eval)  # formatter requires float
+        return result
 
     def _build_answer_metrics_df(
         self,
@@ -1346,12 +1376,15 @@ class EvaluationResult:
         metrics_df = pd.DataFrame.from_records(metrics, index=documents["multilabel_id"].unique())
         return metrics_df
 
-    def save(self, out_dir: Union[str, Path]):
+    def save(self, out_dir: Union[str, Path], **to_csv_kwargs):
         """
         Saves the evaluation result.
         The result of each node is saved in a separate csv with file name {node_name}.csv to the out_dir folder.
 
         :param out_dir: Path to the target folder the csvs will be saved.
+        :param to_csv_kwargs: kwargs to be passed to pd.DataFrame.to_csv(). See https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.to_csv.html.
+                        This method uses different default values than pd.DataFrame.to_csv() for the following parameters:
+                        index=False, quoting=csv.QUOTE_NONNUMERIC (to avoid problems with \r chars)
         """
         out_dir = out_dir if isinstance(out_dir, Path) else Path(out_dir)
         logger.info(f"Saving evaluation results to {out_dir}")
@@ -1359,29 +1392,45 @@ class EvaluationResult:
             out_dir.mkdir(parents=True)
         for node_name, df in self.node_results.items():
             target_path = out_dir / f"{node_name}.csv"
-            df.to_csv(target_path, index=False, header=True)
+            default_to_csv_kwargs = {
+                "index": False,
+                "quoting": csv.QUOTE_NONNUMERIC,  # avoids problems with \r chars in texts by enclosing all string values in quotes
+            }
+            to_csv_kwargs = {**default_to_csv_kwargs, **to_csv_kwargs}
+            df.to_csv(target_path, **to_csv_kwargs)
 
     @classmethod
-    def load(cls, load_dir: Union[str, Path]):
+    def load(cls, load_dir: Union[str, Path], **read_csv_kwargs):
         """
         Loads the evaluation result from disk. Expects one csv file per node. See save() for further information.
 
         :param load_dir: The directory containing the csv files.
+        :param read_csv_kwargs: kwargs to be passed to pd.read_csv(). See https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.read_csv.html.
+                                This method uses different default values than pd.read_csv() for the following parameters:
+                                header=0, converters=CONVERTERS
+                                where CONVERTERS is a dictionary mapping all array typed columns to ast.literal_eval.
         """
         load_dir = load_dir if isinstance(load_dir, Path) else Path(load_dir)
         csv_files = [file for file in load_dir.iterdir() if file.is_file() and file.suffix == ".csv"]
         cols_to_convert = [
+            "filters",
             "gold_document_ids",
+            "gold_custom_document_ids",
             "gold_contexts",
             "gold_answers",
+            "gold_documents_id_match",
             "gold_offsets_in_documents",
             "gold_answers_exact_match",
             "gold_answers_f1",
-            "gold_answers_document_id_match",
-            "gold_context_similarity",
+            "gold_answers_sas",
+            "gold_answers_match",
+            "gold_contexts_similarity",
+            "offsets_in_document",
         ]
         converters = dict.fromkeys(cols_to_convert, ast.literal_eval)
-        node_results = {file.stem: pd.read_csv(file, header=0, converters=converters) for file in csv_files}
+        default_read_csv_kwargs = {"converters": converters, "header": 0}
+        read_csv_kwargs = {**default_read_csv_kwargs, **read_csv_kwargs}
+        node_results = {file.stem: pd.read_csv(file, **read_csv_kwargs) for file in csv_files}
         # backward compatibility mappings
         for df in node_results.values():
             df.rename(columns={"gold_document_contents": "gold_contexts", "content": "context"}, inplace=True)

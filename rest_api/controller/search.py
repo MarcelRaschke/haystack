@@ -1,9 +1,9 @@
 from typing import Dict, Any
 
+import collections
 import logging
 import time
 import json
-from numpy import ndarray
 
 from pydantic import BaseConfig
 from fastapi import FastAPI, APIRouter
@@ -72,7 +72,7 @@ def _process_request(pipeline, request) -> Dict[str, Any]:
 
     # format targeted node filters (e.g. "params": {"Retriever": {"filters": {"value"}}})
     for key in params.keys():
-        if "filters" in params[key].keys():
+        if isinstance(params[key], collections.Mapping) and "filters" in params[key].keys():
             params[key]["filters"] = _format_filters(params[key]["filters"])
 
     result = pipeline.run(query=request.query, params=params, debug=request.debug)
@@ -82,11 +82,6 @@ def _process_request(pipeline, request) -> Dict[str, Any]:
         result["documents"] = []
     if not "answers" in result:
         result["answers"] = []
-
-    # if any of the documents contains an embedding as an ndarray the latter needs to be converted to list of float
-    for document in result["documents"]:
-        if isinstance(document.embedding, ndarray):
-            document.embedding = document.embedding.tolist()
 
     logger.info(
         json.dumps({"request": request, "response": result, "time": f"{(time.time() - start_time):.2f}"}, default=str)
